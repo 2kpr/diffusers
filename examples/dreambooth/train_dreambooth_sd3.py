@@ -579,6 +579,11 @@ def parse_args(input_args=None):
         ),
     )
     parser.add_argument("--local_rank", type=int, default=-1, help="For distributed training: local_rank")
+    parser.add_argument(
+        "--fused_backward_pass",
+        action="store_true",
+        help="Combines backward pass and optimizer step to reduce VRAM usage",
+    )
 
     if input_args is not None:
         args = parser.parse_args(input_args)
@@ -897,6 +902,8 @@ def encode_prompt(
     prompt: str,
     device=None,
     num_images_per_prompt: int = 1,
+    transformer=None,
+    weight_dtype=torch.bfloat16,
 ):
     prompt = [prompt] if isinstance(prompt, str) else prompt
 
@@ -916,9 +923,11 @@ def encode_prompt(
         clip_prompt_embeds_list.append(prompt_embeds)
         clip_pooled_prompt_embeds_list.append(pooled_prompt_embeds)
 
+    #print(clip_prompt_embeds_list)
+    #print(clip_pooled_prompt_embeds_list)
     clip_prompt_embeds = torch.cat(clip_prompt_embeds_list, dim=-1)
     pooled_prompt_embeds = torch.cat(clip_pooled_prompt_embeds_list, dim=-1)
-
+    '''
     t5_prompt_embed = _encode_prompt_with_t5(
         text_encoders[-1],
         tokenizers[-1],
@@ -926,7 +935,14 @@ def encode_prompt(
         num_images_per_prompt=num_images_per_prompt,
         device=device if device is not None else text_encoders[-1].device,
     )
-
+    '''
+    t5_prompt_embed = torch.zeros(
+        (1, tokenizers[0].model_max_length, transformer.config.joint_attention_dim),
+        device=device if device is not None else text_encoder.device,
+        dtype=weight_dtype,
+    )
+    #print(t5_prompt_embed.shape[-1], clip_prompt_embeds.shape[-1])
+    #print(t5_prompt_embed.shape[-1] - clip_prompt_embeds.shape[-1])
     clip_prompt_embeds = torch.nn.functional.pad(
         clip_prompt_embeds, (0, t5_prompt_embed.shape[-1] - clip_prompt_embeds.shape[-1])
     )
@@ -1095,11 +1111,11 @@ def main(args):
     if args.train_text_encoder:
         text_encoder_one.requires_grad_(True)
         text_encoder_two.requires_grad_(True)
-        text_encoder_three.requires_grad_(True)
+        #text_encoder_three.requires_grad_(True)
     else:
         text_encoder_one.requires_grad_(False)
         text_encoder_two.requires_grad_(False)
-        text_encoder_three.requires_grad_(False)
+        #text_encoder_three.requires_grad_(False)
 
     # For mixed precision training we cast all non-trainable weights (vae, non-lora text_encoder and non-lora transformer) to half-precision
     # as these weights are only used for inference, keeping weights in full precision is not required.
@@ -1119,14 +1135,14 @@ def main(args):
     if not args.train_text_encoder:
         text_encoder_one.to(accelerator.device, dtype=weight_dtype)
         text_encoder_two.to(accelerator.device, dtype=weight_dtype)
-        text_encoder_three.to(accelerator.device, dtype=weight_dtype)
+        #text_encoder_three.to(accelerator.device, dtype=weight_dtype)
 
     if args.gradient_checkpointing:
         transformer.enable_gradient_checkpointing()
         if args.train_text_encoder:
             text_encoder_one.gradient_checkpointing_enable()
             text_encoder_two.gradient_checkpointing_enable()
-            text_encoder_three.gradient_checkpointing_enable()
+            #text_encoder_three.gradient_checkpointing_enable()
 
     def unwrap_model(model):
         model = accelerator.unwrap_model(model)
@@ -1223,11 +1239,12 @@ def main(args):
             transformer_parameters_with_lr,
             text_parameters_one_with_lr,
             text_parameters_two_with_lr,
-            text_parameters_three_with_lr,
+            #text_parameters_three_with_lr,
         ]
     else:
         params_to_optimize = [transformer_parameters_with_lr]
 
+    '''
     # Optimizer creation
     if not (args.optimizer.lower() == "prodigy" or args.optimizer.lower() == "adamw"):
         logger.warning(
@@ -1297,6 +1314,15 @@ def main(args):
             use_bias_correction=args.prodigy_use_bias_correction,
             safeguard_warmup=args.prodigy_safeguard_warmup,
         )
+    '''
+
+    from transformers.optimization import Adafactor
+    optimizer_class = transformers.optimization.Adafactor
+    optimizer = optimizer_class(
+        params_to_optimize,
+        lr=args.learning_rate,
+        relative_step=False,
+    )
 
     # Dataset and DataLoaders creation:
     train_dataset = DreamBoothDataset(
@@ -1324,7 +1350,7 @@ def main(args):
 
         def compute_text_embeddings(prompt, text_encoders, tokenizers):
             with torch.no_grad():
-                prompt_embeds, pooled_prompt_embeds = encode_prompt(text_encoders, tokenizers, prompt)
+                prompt_embeds, pooled_prompt_embeds = encode_prompt(text_encoders, tokenizers, prompt, transformer=transformer, weight_dtype=weight_dtype)
                 prompt_embeds = prompt_embeds.to(accelerator.device)
                 pooled_prompt_embeds = pooled_prompt_embeds.to(accelerator.device)
             return prompt_embeds, pooled_prompt_embeds
@@ -1337,6 +1363,13 @@ def main(args):
             args.instance_prompt, text_encoders, tokenizers
         )
 
+    #del text_encoder_one
+    #del text_encoder_two
+    del text_encoder_three
+    import gc
+    gc.collect()
+    torch.cuda.empty_cache()
+    
     # Handle class prompt for prior-preservation.
     if args.with_prior_preservation:
         if not args.train_text_encoder:
@@ -1367,14 +1400,14 @@ def main(args):
         else:
             tokens_one = tokenize_prompt(tokenizer_one, args.instance_prompt)
             tokens_two = tokenize_prompt(tokenizer_two, args.instance_prompt)
-            tokens_three = tokenize_prompt(tokenizer_three, args.instance_prompt)
+            #tokens_three = tokenize_prompt(tokenizer_three, args.instance_prompt)
             if args.with_prior_preservation:
                 class_tokens_one = tokenize_prompt(tokenizer_one, args.class_prompt)
                 class_tokens_two = tokenize_prompt(tokenizer_two, args.class_prompt)
                 class_tokens_three = tokenize_prompt(tokenizer_three, args.class_prompt)
                 tokens_one = torch.cat([tokens_one, class_tokens_one], dim=0)
                 tokens_two = torch.cat([tokens_two, class_tokens_two], dim=0)
-                tokens_three = torch.cat([tokens_three, class_tokens_three], dim=0)
+                #tokens_three = torch.cat([tokens_three, class_tokens_three], dim=0)
 
     # Scheduler and math around the number of training steps.
     overrode_max_train_steps = False
@@ -1398,7 +1431,7 @@ def main(args):
             transformer,
             text_encoder_one,
             text_encoder_two,
-            text_encoder_three,
+            #text_encoder_three,
             optimizer,
             train_dataloader,
             lr_scheduler,
@@ -1406,7 +1439,7 @@ def main(args):
             transformer,
             text_encoder_one,
             text_encoder_two,
-            text_encoder_three,
+            #text_encoder_three,
             optimizer,
             train_dataloader,
             lr_scheduler,
@@ -1490,17 +1523,31 @@ def main(args):
             sigma = sigma.unsqueeze(-1)
         return sigma
 
+    if args.fused_backward_pass:
+        import adafactor_fused
+        adafactor_fused.patch_adafactor_fused(optimizer)
+        for param_group in optimizer.param_groups:
+            for parameter in param_group["params"]:
+                if parameter.requires_grad:
+                    def __grad_hook(tensor: torch.Tensor, param_group=param_group):
+                        if accelerator.sync_gradients:
+                            accelerator.clip_grad_norm_(tensor, args.max_grad_norm)
+                        optimizer.step_param(tensor, param_group)
+                        tensor.grad = None
+
+                    parameter.register_post_accumulate_grad_hook(__grad_hook)
+
     for epoch in range(first_epoch, args.num_train_epochs):
         transformer.train()
         if args.train_text_encoder:
             text_encoder_one.train()
             text_encoder_two.train()
-            text_encoder_three.train()
+            #text_encoder_three.train()
 
         for step, batch in enumerate(train_dataloader):
             models_to_accumulate = [transformer]
             if args.train_text_encoder:
-                models_to_accumulate.extend([text_encoder_one, text_encoder_two, text_encoder_three])
+                models_to_accumulate.extend([text_encoder_one, text_encoder_two])#, text_encoder_three])
             with accelerator.accumulate(models_to_accumulate):
                 pixel_values = batch["pixel_values"].to(dtype=vae.dtype)
                 prompts = batch["prompts"]
@@ -1514,7 +1561,7 @@ def main(args):
                     else:
                         tokens_one = tokenize_prompt(tokenizer_one, prompts)
                         tokens_two = tokenize_prompt(tokenizer_two, prompts)
-                        tokens_three = tokenize_prompt(tokenizer_three, prompts)
+                        #tokens_three = tokenize_prompt(tokenizer_three, prompts)
 
                 # Convert images to latent space
                 model_input = vae.encode(pixel_values).latent_dist.sample()
@@ -1544,10 +1591,12 @@ def main(args):
                     )[0]
                 else:
                     prompt_embeds, pooled_prompt_embeds = encode_prompt(
-                        text_encoders=[text_encoder_one, text_encoder_two, text_encoder_three],
-                        tokenizers=None,
-                        prompt=None,
-                        text_input_ids_list=[tokens_one, tokens_two, tokens_three],
+                        text_encoders=[text_encoder_one, text_encoder_two],#, text_encoder_three],
+                        tokenizers=[tokenizer_one, tokenizer_two],#, tokenizer_three],
+                        prompt=args.instance_prompt,
+                        #text_input_ids_list=[tokens_one, tokens_two],#, tokens_three],
+                        transformer=transformer,
+                        weight_dtype=weight_dtype,
                     )
                     model_pred = transformer(
                         hidden_states=noisy_model_input,
@@ -1602,21 +1651,22 @@ def main(args):
                     # Add the prior loss to the instance loss.
                     loss = loss + args.prior_loss_weight * prior_loss
 
-                accelerator.backward(loss)
-                if accelerator.sync_gradients:
-                    params_to_clip = (
-                        itertools.chain(
-                            transformer.parameters(),
-                            text_encoder_one.parameters(),
-                            text_encoder_two.parameters(),
-                            text_encoder_three.parameters(),
+                accelerator.backward(loss)encode_prompt(
+                if not args.fused_backward_pass:
+                    if accelerator.sync_gradients:
+                        params_to_clip = (
+                            itertools.chain(
+                                transformer.parameters(),
+                                text_encoder_one.parameters(),
+                                text_encoder_two.parameters(),
+                                #text_encoder_three.parameters(),
+                            )
+                            if args.train_text_encoder
+                            else transformer.parameters()
                         )
-                        if args.train_text_encoder
-                        else transformer.parameters()
-                    )
-                    accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
+                        accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
 
-                optimizer.step()
+                    optimizer.step()
                 lr_scheduler.step()
                 optimizer.zero_grad()
 
@@ -1697,13 +1747,13 @@ def main(args):
         if args.train_text_encoder:
             text_encoder_one = unwrap_model(text_encoder_one)
             text_encoder_two = unwrap_model(text_encoder_two)
-            text_encoder_three = unwrap_model(text_encoder_three)
+            #text_encoder_three = unwrap_model(text_encoder_three)
             pipeline = StableDiffusion3Pipeline.from_pretrained(
                 args.pretrained_model_name_or_path,
                 transformer=transformer,
                 text_encoder=text_encoder_one,
                 text_encoder_2=text_encoder_two,
-                text_encoder_3=text_encoder_three,
+                #text_encoder_3=text_encoder_three,
             )
         else:
             pipeline = StableDiffusion3Pipeline.from_pretrained(
