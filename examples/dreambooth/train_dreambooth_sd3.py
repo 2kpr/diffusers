@@ -1651,7 +1651,7 @@ def main(args):
                     # Add the prior loss to the instance loss.
                     loss = loss + args.prior_loss_weight * prior_loss
 
-                accelerator.backward(loss)encode_prompt(
+                accelerator.backward(loss)
                 if not args.fused_backward_pass:
                     if accelerator.sync_gradients:
                         params_to_clip = (
